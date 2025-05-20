@@ -1,7 +1,7 @@
 
 console.log('JEST IS USING THE MANUAL MOCK FOR socket.io-client');
 // src/__mocks__/socket.io-client.ts
-type EventHandler = (...args: any[]) => void;
+export type EventHandler = (...args: any[]) => void;
 
 interface MockSocket {
     on: jest.Mock<any, [string, EventHandler]>;
@@ -11,7 +11,7 @@ interface MockSocket {
     removeAllListeners: jest.Mock<void, []>;
     connected: boolean;
     _trigger: (event: string, ...args: any[]) => void;
-    _simulateConnectError: () => void;
+    _simulateConnectError: (error?: Error) => void;
     _simulateSuccessfulConnect: () => void;
     _handlers: Record<string, EventHandler[]>; // <<< ADDED THIS LINE
     hola: string
@@ -72,7 +72,7 @@ const mockSocketInstance: MockSocket = {
             console.warn(`MOCK_SOCKET_TRIGGER_WARN: No handlers registered for event "${event}" in mockSocketInstance._handlers to trigger.`);
         }
     },
-    _simulateConnectError: () => {
+    _simulateConnectError: (error?: Error) => {
         // mockSocketInstance.connected = false;
         // // Ensure _trigger uses the instance's _handlers
         // mockSocketInstance._trigger('connect_error', new Error('Simulated connection error'));
@@ -80,7 +80,7 @@ const mockSocketInstance: MockSocket = {
 
         console.log('MOCK: _simulateConnectError called');
         mockSocketInstance.connected = false;
-        mockSocketInstance._trigger('connect_error', new Error('Simulated connection error'));
+        mockSocketInstance._trigger('connect_error', error || new Error('Simulated connection error'));
         console.log('MOCK: connect_error triggered');
         mockSocketInstance._trigger('disconnect', 'transport error');
         console.log('MOCK: disconnect triggered');

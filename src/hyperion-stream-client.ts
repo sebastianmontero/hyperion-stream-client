@@ -168,6 +168,7 @@ export class HyperionStreamClient {
             this.lastReceivedBlock = 0;
             this.savedRequests = [];
         }
+        console.log(`HSC_DISCONNECT_END: connectionInProgress final state: ${this.connectionInProgress}`);
     }
 
     get lastBlockNum(): number {
@@ -453,75 +454,101 @@ export class HyperionStreamClient {
     }
 
     private async _attemptNextConnection(attemptCycleCount: number): Promise<void> {
-        console.log(`HSC: _attemptNextConnection, attemptCycleCount: ${attemptCycleCount}, endpoint: ${this.internalEndpoints[this.currentEndpointIndex]}`);
+        // Log entry point and initial state
+        console.log(`HSC_ACN_ENTRY: Cycle: ${attemptCycleCount}, Current EP Index: ${this.currentEndpointIndex}, EP: ${this.internalEndpoints[this.currentEndpointIndex] || 'N/A'}, connectionInProgress: ${this.connectionInProgress}`);
+    
         if (!this.connectionInProgress) {
-            this.debugLog("Connection process aborted during _attemptNextConnection.");
-            // If there's a pending connect() promise, it should be rejected by disconnect() or by this path if not tryForever
+            this.debugLog("Connection process aborted during _attemptNextConnection (top check).");
             if (!this.options.tryForever && this._initialConnectPromiseCallbacks && !this._initialConnectionSucceededThisAttempt) {
+                 console.log('HSC_ACN_ABORT: Top check, !connectionInProgress, rejecting initial promise.');
                  this._initialConnectPromiseCallbacks.reject(new Error("Connection process aborted."));
             }
             return;
         }
-
+    
         if (this.internalEndpoints.length === 0) {
             this.debugLog("No endpoints to attempt connection.");
             if (this._initialConnectPromiseCallbacks && !this._initialConnectionSucceededThisAttempt) {
+                console.log('HSC_ACN_ABORT: No endpoints, rejecting initial promise.');
                 this._initialConnectPromiseCallbacks.reject(new Error("No endpoints configured."));
             }
-            this.connectionInProgress = false; // Stop attempts
+            this.connectionInProgress = false;
             return;
         }
-
+    
         const endpointToTry = this.internalEndpoints[this.currentEndpointIndex];
-        if (!endpointToTry) { // Should not happen if internalEndpoints is not empty and index is managed
+        if (!endpointToTry) {
             this.debugLog(`Error: Endpoint at index ${this.currentEndpointIndex} is undefined. Resetting index.`);
-            this.currentEndpointIndex = 0; // Reset index to prevent endless loop on bad index
-            // If we are trying forever, schedule a new cycle. Otherwise, fail the initial connect.
+            this.currentEndpointIndex = 0;
             if (this.options.tryForever) {
-                this._scheduleReconnect(); // Will use the reset index
+                console.log('HSC_ACN_RETRY_BAD_INDEX: Bad endpoint index, tryForever, scheduling reconnect.');
+                this._scheduleReconnect();
             } else {
                 if (this._initialConnectPromiseCallbacks && !this._initialConnectionSucceededThisAttempt) {
+                    console.log('HSC_ACN_ABORT: Bad endpoint index, not tryForever, rejecting initial promise.');
                     this._initialConnectPromiseCallbacks.reject(new Error("Internal error: Invalid endpoint index during connection attempt."));
                 }
-                this.connectionInProgress = false; // Stop attempts
+                this.connectionInProgress = false;
             }
             return;
         }
-
+    
+        this.debugLog(`HSC_ACN_ATTEMPTING: Cycle: ${attemptCycleCount}, Attempting endpoint: ${endpointToTry}`); // More specific debug log
+    
         try {
             await this._createSocketConnection(endpointToTry);
-            // Successful connection to 'endpointToTry'!
-            // onConnect in _createSocketConnection handles resolving _initialConnectPromiseCallbacks.
+            // If successful, onConnect in _createSocketConnection would have called:
+            // - this._initialConnectionSucceededThisAttempt = true;
+            // - this._initialConnectPromiseCallbacks.resolve();
+            // - this._initialConnectPromiseCallbacks = undefined;
+            console.log(`HSC_ACN_SUCCESS: Successfully connected to ${endpointToTry}. connectionInProgress will be set to false.`);
             this.connectionInProgress = false; // This *cycle* of connection attempts is now complete (successfully).
-                                             // If it disconnects later, onSocketDisconnect will set connectionInProgress = true for retries.
         } catch (error) {
-            console.log(`HSC: _attemptNextConnection failed for ${endpointToTry}. Cycling to next.`);
-            // Connection to current endpoint (endpointToTry) failed
+            // This 'error' is from the rejection of _createSocketConnection's promise for endpointToTry
+            console.log(`HSC_ACN_CATCH: Attempt for ${endpointToTry} failed. Error: ${error instanceof Error ? error.message : String(error)}`);
             this.debugLog(`Failed to connect to ${endpointToTry}. Attempt in cycle: ${attemptCycleCount + 1}/${this.internalEndpoints.length}. Error: ${error}`);
+    
+            if (!this.connectionInProgress) {
+                // This means disconnect() was called (e.g., by afterEach) while _createSocketConnection was pending and then rejected.
+                console.log(`HSC_ACN_CATCH_ABORTED: Connection process was aborted (e.g. by disconnect()) during failover processing for ${endpointToTry}.`);
+                // The _initialConnectPromiseCallbacks would likely have been rejected by disconnect() already.
+                return;
+            }
             
             if (attemptCycleCount + 1 >= this.internalEndpoints.length) {
                 // All endpoints in the current list have been tried in this cycle
                 this.debugLog(`All ${this.internalEndpoints.length} endpoints failed in this connection cycle. Last attempt: ${endpointToTry}.`);
                 this.emit(StreamClientEvents.ALL_ENDPOINTS_FAILED, { endpoints: this.internalEndpoints });
-
+    
                 if (this.options.tryForever) {
-                    this.currentEndpointIndex = (this.currentEndpointIndex + 1) % this.internalEndpoints.length; // Prepare for next cycle
-                    // connectionInProgress remains true
-                    this._scheduleReconnect(); // Schedule a full new cycle of attempts
-                    // The connect() promise remains pending if tryForever
+                    this.currentEndpointIndex = (this.currentEndpointIndex + 1) % this.internalEndpoints.length;
+                    console.log(`HSC_ACN_ALL_FAILED_TRY_FOREVER: All endpoints failed. tryForever is true. Scheduling reconnect. connectionInProgress remains ${this.connectionInProgress}.`);
+                    this._scheduleReconnect();
                 } else {
                     // Not trying forever, and all endpoints in the initial cycle failed
                     if (this._initialConnectPromiseCallbacks && !this._initialConnectionSucceededThisAttempt) {
-                        console.log('HSC: _attemptNextConnection REJECTING initial promise.');
+                        console.log('HSC_ACN_ALL_FAILED_REJECT: All endpoints failed, not tryForever. Rejecting initial promise.');
                         this._initialConnectPromiseCallbacks.reject(new Error('All configured endpoints failed to connect.'));
                     }
-                    this.connectionInProgress = false; // Stop connection attempts
+                    this.connectionInProgress = false;
+                    console.log(`HSC_ACN_ALL_FAILED_DONE: All endpoints failed, not tryForever. connectionInProgress set to ${this.connectionInProgress}.`);
                 }
             } else {
                 // More endpoints to try in this current cycle
                 this.currentEndpointIndex = (this.currentEndpointIndex + 1) % this.internalEndpoints.length;
-                // connectionInProgress remains true; try next endpoint immediately (recursive call)
-                await this._attemptNextConnection(attemptCycleCount + 1);
+                const nextEndpointToTry = this.internalEndpoints[this.currentEndpointIndex];
+                console.log(`HSC_ACN_RECURSE: For ${endpointToTry} FAILED. ConnectionInProgress BEFORE rec_call: ${this.connectionInProgress}. Trying next: ${nextEndpointToTry}`);
+                
+                if (this.connectionInProgress) { // Check again right before recursive call
+                    await this._attemptNextConnection(attemptCycleCount + 1);
+                } else {
+                    console.log(`HSC_ACN_RECURSE_ABORTED_PRE_CALL: Aborting recursive attempt for ${nextEndpointToTry} because connectionInProgress is false.`);
+                    if (this._initialConnectPromiseCallbacks && !this._initialConnectionSucceededThisAttempt && !this.options.tryForever) {
+                         console.log('HSC_ACN_RECURSE_ABORTED_REJECT: Recursive call aborted, rejecting initial promise as "Connection process aborted by external stop during failover recursion."');
+                         this._initialConnectPromiseCallbacks.reject(new Error("Connection process aborted by external stop during failover recursion."));
+                    }
+                }
+                console.log(`HSC_ACN_RECURSE_DONE: Recursive call for ${nextEndpointToTry} finished. ConnectionInProgress AFTER rec_call: ${this.connectionInProgress}.`);
             }
         }
     }
