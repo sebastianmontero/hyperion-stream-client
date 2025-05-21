@@ -259,13 +259,53 @@ export class HyperionStreamClient {
         this._clearLibActivityTimer();
         if (this.options.libActivityTimeoutMs && this.options.libActivityTimeoutMs > 0 && this.online) {
             this.libActivityTimer = setTimeout(() => {
-                this.debugLog(`No 'lib_update' received for ${this.options.libActivityTimeoutMs}ms. Assuming stalled connection. Attempting reconnect.`);
+                const currentActiveURL = this.activeEndpointURL; // Capture current active URL for logging
+                const socketToDisconnect = this.socket;           // Capture the current socket
+        
+                this.debugLog(`No 'lib_update' received for ${this.options.libActivityTimeoutMs}ms on ${currentActiveURL || 'unknown endpoint'}. Assuming stalled connection.`);
                 this.emit(StreamClientEvents.LIBACTIVITY_TIMEOUT);
-                if (this.socket) {
-                    this.socket.disconnect();
+        
+                if (socketToDisconnect) {
+                    console.log(`HSC: LIB Timeout on ${currentActiveURL}. Socket to disconnect is defined: ${!!socketToDisconnect}. Initiating reconnect cycle.`);
+                    this.online = false; // Go offline immediately as this connection is deemed stale
+        
+                    // Disconnect this specific socket. Its onSocketDisconnect handler will be called.
+                    // The onSocketDisconnect handler should primarily clean up that socket instance's state
+                    // and not interfere with the new connection cycle we are about to start if tryForever is false.
+                    socketToDisconnect.disconnect();
+        
+                    // Now, prepare for and start a new connection attempt cycle,
+                    // regardless of tryForever for this first proactive attempt after LIB timeout.
+                    if (!this.connectionInProgress) { // Only start if not already in some other connection process
+                        this.connectionInProgress = true;
+                        // Decide which endpoint to try next for the new cycle.
+                        // Starting from the next in the list is a good default.
+                        this.currentEndpointIndex = (this.currentEndpointIndex + 1) % this.internalEndpoints.length;
+                        console.log(`HSC: LIB Timeout - Starting new connection attempt cycle. Next EP index: ${this.currentEndpointIndex}, EP: ${this.internalEndpoints[this.currentEndpointIndex]}`);
+                        this._attemptNextConnection(0) // Start a fresh cycle (attemptCycleCount = 0)
+                            .catch(err => {
+                                // This catch is for if _attemptNextConnection itself throws an unhandled error
+                                // (e.g., if all endpoints in the new cycle also fail and tryForever is false).
+                                console.error("HSC: Reconnect cycle initiated by LIB timeout failed.", err);
+                                // connectionInProgress will be set to false by _attemptNextConnection
+                                // if all attempts in this new cycle fail and tryForever is false.
+                            });
+                    } else {
+                        this.debugLog(`HSC: LIB Timeout occurred, but another connection process was already in progress. No new cycle started by timeout handler.`);
+                    }
                 } else {
-                    // This case might occur if the socket was already cleaned up by another process
-                    this._handleStalledConnectionFallback();
+                    this.debugLog(`HSC: LIB Timeout, but no active socket. Client was likely already disconnected or not connected.`);
+                    // If tryForever is true and we are not connected and not in progress, maybe start a cycle?
+                    // This depends on how strictly "tryForever" should apply even if client was idle.
+                    // For now, let's assume it only applies if there was a socket or an ongoing attempt.
+                    if (this.options.tryForever && !this.connectionInProgress) {
+                        this.debugLog(`HSC: LIB Timeout, no active socket, but tryForever is true. Initiating connection attempt.`);
+                        this.connectionInProgress = true;
+                        this.currentEndpointIndex = 0; // Start from the beginning
+                        this._attemptNextConnection(0).catch(err => {
+                            console.error("HSC: tryForever connection attempt after LIB timeout (no socket) failed.", err);
+                        });
+                    }
                 }
             }, this.options.libActivityTimeoutMs);
         }
@@ -369,36 +409,48 @@ export class HyperionStreamClient {
 
             const onSocketDisconnect = (reason: Socket.DisconnectReason) => {
                 // Use endpointUrl (captured by this closure) as the identifier for the socket that disconnected.
-                console.log(`HSC: onSocketDisconnect handler entered for ${endpointUrl}, reason: ${reason}, current this.connectionInProgress: ${this.connectionInProgress}`);
+                // THIS 'endpointUrl' is specific to the socket for which this handler was created.
+                console.log(`HSC: onSocketDisconnect handler entered for ACTUAL URL: ${endpointUrl}, reason: ${reason}, current this.connectionInProgress: ${this.connectionInProgress}, client.activeEndpointURL currently: ${this.activeEndpointURL}`);
                 this._clearLibActivityTimer();
                 currentAttemptSocket.removeAllListeners();
-
+    
                 const previouslyOnline = this.online;
-                // Use endpointUrl for debug logging. If this.activeEndpointURL was cleared by another path, endpointUrl is more reliable here.
-                this.debugLog(`Socket disconnected from ${endpointUrl}: ${reason}`);
-
+                this.debugLog(`Socket disconnected from ${endpointUrl}: ${reason}`); // Use closure endpointUrl
+    
                 if (this.socket === currentAttemptSocket) {
                     this.online = false;
-                    this.activeEndpointURL = undefined; // Safe to clear as it was this socket's URL
+                    // Only clear this.activeEndpointURL if it matches the one for this socket.
+                    // If another connection attempt has already updated this.activeEndpointURL, don't clear it.
+                    if (this.activeEndpointURL === endpointUrl) {
+                        this.activeEndpointURL = undefined;
+                    }
                     this.socket = undefined;
                 }
-
+    
                 if (previouslyOnline || this.connectionInProgress) {
-                    this.emit(StreamClientEvents.DISCONNECT, { reason, endpoint: endpointUrl }); // Use endpointUrl for event
+                    this.emit(StreamClientEvents.DISCONNECT, { reason, endpoint: endpointUrl }); // Use closure endpointUrl
                 }
-
-                if (reason === 'io client disconnect') {
-                    // this.connectionInProgress is already (or will be) handled by the public disconnect() method
-                } else if (this.options.tryForever && this.connectionInProgress) {
-                    if (previouslyOnline) { // If an established, online connection dropped
+    
+                if (reason === 'io client disconnect') { // Usually means client.disconnect() or socket.disconnect() was called
+                    // If this disconnect was triggered by our own LIB timeout's socket.disconnect(),
+                    // the LIB timeout handler itself is responsible for initiating the next connection attempt.
+                    // We should not set connectionInProgress = false here if LIB timeout wants to retry.
+                    // The public client.disconnect() method handles setting connectionInProgress to false.
+                    // So, if this 'io client disconnect' is from the LIB timeout, connectionInProgress might still be true
+                    // (because LIB timeout sets it true before calling _attemptNextConnection).
+                    if (!this.connectionInProgress) { // Only if something else truly stopped it.
+                        // this.connectionInProgress = false; // This line might be problematic.
+                    }
+                } else if (this.options.tryForever) { // For other disconnect reasons (e.g. transport error)
+                    if (previouslyOnline && !this.connectionInProgress) { // Check !this.connectionInProgress to avoid multiple cycles
                         this.debugLog(`Established connection to ${endpointUrl} dropped. Scheduling reconnect (tryForever).`);
+                        this.connectionInProgress = true;
                         this.currentEndpointIndex = (this.currentEndpointIndex + 1) % this.internalEndpoints.length;
                         this._scheduleReconnect();
+                    } else if (this.connectionInProgress) {
+                        this.debugLog(`Disconnect during tryForever cycle for ${endpointUrl}. _attemptNextConnection will handle.`);
                     }
-                    // If it's during initial connect() with tryForever, _attemptNextConnection handles retries without this _scheduleReconnect.
                 }
-                // No "else" here that sets connectionInProgress = false for intermediate failures.
-                // _attemptNextConnection handles that for non-tryForever initial cycles.
             };
 
             const onError = (error: any) => {
@@ -422,33 +474,40 @@ export class HyperionStreamClient {
     }
 
     private _scheduleReconnect(): void {
-        if (!this.connectionInProgress) {
-            this.debugLog("Reconnection process not active, _scheduleReconnect will not proceed.");
+        // Ensure we are actually supposed to be in a connection process.
+        // This might be redundant if callers of _scheduleReconnect already ensure this.
+        if (!this.connectionInProgress && !this.options.tryForever) { // Added !this.options.tryForever
+            this.debugLog("Reconnection process not active and not tryForever, _scheduleReconnect will not proceed.");
             return;
         }
-        // currentEndpointIndex should have been advanced by the caller before calling _scheduleReconnect
+        // If tryForever, we might want to initiate connectionInProgress here if it somehow became false
+        if (this.options.tryForever && !this.connectionInProgress) {
+            this.debugLog("TryForever is true, ensuring connectionInProgress for scheduled reconnect.");
+            this.connectionInProgress = true;
+        }
+    
+    
+        // currentEndpointIndex should have been advanced by the caller
         const nextEndpoint = this.internalEndpoints[this.currentEndpointIndex];
         this.debugLog(`Scheduling reconnect attempt in ${this.options.reconnectDelay}ms to endpoint index ${this.currentEndpointIndex} (${nextEndpoint || 'N/A'})`);
-
+    
         setTimeout(() => {
-            if (this.connectionInProgress) { // Check again, in case disconnect() was called during timeout
-                 this._attemptNextConnection(0).catch(err => {
-                    // This catch is for the case where _attemptNextConnection itself throws an unhandled error
+            if (this.connectionInProgress) {
+                this.debugLog(`Executing scheduled reconnect to ${this.internalEndpoints[this.currentEndpointIndex]}`);
+                this._attemptNextConnection(0).catch(err => { // Start a new cycle (attemptCycleCount = 0)
                     console.error("Scheduled reconnect attempt cycle encountered an unhandled error:", err);
-                    // If tryForever, and even the attempt to start a cycle fails, schedule another.
                     if (this.options.tryForever && this.connectionInProgress) {
-                        this.currentEndpointIndex = (this.currentEndpointIndex + 1) % this.internalEndpoints.length; // Advance for next try
-                        this._scheduleReconnect();
+                        this.currentEndpointIndex = (this.currentEndpointIndex + 1) % this.internalEndpoints.length;
+                        this._scheduleReconnect(); // Schedule another if even starting the cycle fails
                     } else {
-                        this.connectionInProgress = false; // Give up if not tryForever
-                         if(this._initialConnectPromiseCallbacks && !this._initialConnectionSucceededThisAttempt){
+                        this.connectionInProgress = false;
+                        if(this._initialConnectPromiseCallbacks && !this._initialConnectionSucceededThisAttempt){
                             this._initialConnectPromiseCallbacks.reject(new Error("Reconnect cycle failed to start and not trying forever."));
-                            // _initialConnectPromiseCallbacks cleared by connect() promise settlement
                         }
                     }
-                 });
+                });
             } else {
-                this.debugLog("Reconnection aborted as client is no longer in a connection process.");
+                this.debugLog("Reconnection aborted as client is no longer in a connection process (timeout executed).");
             }
         }, this.options.reconnectDelay);
     }
@@ -613,18 +672,54 @@ export class HyperionStreamClient {
     }
 
     private processActionTrace(action: ActionContent, mode: "live" | "history"): void {
-        const metaKey = '@' + action['act'].name;
-        if (action[metaKey]) {
-            const parsedData = action[metaKey];
-            Object.keys(parsedData).forEach((key) => {
-                if (!action['act']['data']) action['act']['data'] = {};
-                action['act']['data'][key] = parsedData[key];
-            });
-            delete action[metaKey];
+        // Log entry with more identifying information
+        console.log(`HSC_PROCESS_ACTION: Entered. Action Name: ${action.act?.name}, Block num: ${action.block_num}, Trx ID: ${action.trx_id}`);
+    
+        // Ensure act object and name exist before trying to create metaKey
+        if (action.act && typeof action.act.name === 'string') {
+            const metaKey = '@' + action.act.name;
+            // Check if the metaKey itself exists (e.g., '@transfer')
+            if (action[metaKey] && typeof action[metaKey] === 'object' && action[metaKey] !== null) {
+                console.log(`HSC_PROCESS_ACTION: Found metaKey '${metaKey}'. Processing its data.`);
+                const parsedMetaData = action[metaKey];
+                // Ensure act.data exists or initialize it
+                if (!action.act.data || typeof action.act.data !== 'object') {
+                    action.act.data = {};
+                }
+                // Merge meta data into act.data, potentially overwriting
+                Object.keys(parsedMetaData).forEach((key) => {
+                    action.act.data[key] = parsedMetaData[key];
+                });
+                delete action[metaKey]; // Clean up the original metaKey field
+            } else {
+                // Optional: Log if a potential metaKey pattern was seen but not processed,
+                // or if action.act.name was undefined. For now, this is a silent path if no metaKey.
+            }
+        } else {
+            console.warn(`HSC_PROCESS_ACTION: action.act or action.act.name is undefined. Skipping metaKey processing. Action:`, JSON.stringify(action).substring(0,200));
         }
+    
+    
         if (this.dataQueue) {
-            this.dataQueue.push({ type: 'action', mode: mode, content: action, irreversible: false }).catch(console.error);
-            this.lastReceivedBlock = action['block_num'];
+            console.log(`HSC_PROCESS_ACTION: Pushing action (Block: ${action.block_num}, Trx: ${action.trx_id}, Name: ${action.act?.name}) to dataQueue.`);
+            this.dataQueue.push({ type: 'action', mode: mode, content: action, irreversible: false }, (err?: Error | null) => {
+                // This callback is invoked by the 'async' library once the task has been processed by the queue's worker
+                if (err) {
+                    console.error(`HSC_PROCESS_ACTION_QUEUE_CALLBACK: Error reported by dataQueue for action (Block: ${action.block_num}, Trx: ${action.trx_id}). Error:`, err);
+                } else {
+                    console.log(`HSC_PROCESS_ACTION_QUEUE_CALLBACK: dataQueue task processed successfully for action (Block: ${action.block_num}, Trx: ${action.trx_id}).`);
+                }
+            })
+            // The .catch here is for if the .push() operation itself immediately throws an error or returns a rejecting promise
+            // (less common for async.queue's push unless the queue is saturated and configured to reject, or an internal error).
+            // Most errors related to task processing will come via the callback above.
+            // However, some newer versions or specific configurations of async might return a promise from push.
+            // It's safer to have it, but the primary error reporting is from the taskCallback.
+            // .catch(err => console.error(`HSC_PROCESS_ACTION_QUEUE_PUSH_PROMISE_ERROR: Promise rejection from dataQueue.push for action (Block: ${action.block_num}, Trx: ${action.trx_id}). Error:`, err));
+    
+            this.lastReceivedBlock = action.block_num;
+        } else {
+            console.error(`HSC_PROCESS_ACTION: dataQueue is null! Action (Block: ${action.block_num}, Trx: ${action.trx_id}) was not queued.`);
         }
     }
 
@@ -645,24 +740,65 @@ export class HyperionStreamClient {
         }
     }
 
+    // HyperionStreamClient.ts
     private _handleIncomingMessage(msg: any): void {
-        const hasDataSubscribers = this.onDataAsync || this.onLibDataAsync ||
-                               (this.eventListeners.get(StreamClientEvents.DATA)?.length || 0) > 0 ||
-                               (this.tempEventListeners.get(StreamClientEvents.DATA)?.length || 0) > 0;
+        const hasDataSubscribers = !!this.onDataAsync || !!this.onLibDataAsync ||
+                            (this.eventListeners.get(StreamClientEvents.DATA)?.length || 0) > 0 ||
+                            (this.tempEventListeners.get(StreamClientEvents.DATA)?.length || 0) > 0;
 
-        if (hasDataSubscribers && (msg.message || msg['messages'])) {
-            try {
-                const messages = msg['messages'] || [JSON.parse(msg.message)];
-                messages.forEach((messageContent: ActionContent | DeltaContent) => {
+        console.log(`HSC_HANDLE_MSG: Entered. Type: ${msg.type}. Mode: ${msg.mode}. HasDataSubscribers: ${hasDataSubscribers}. onDataAsync set: ${!!this.onDataAsync}. options.async: ${this.options.async}`);
+        console.log(`HSC_HANDLE_MSG: Raw msg object:`, JSON.stringify(msg).substring(0, 200)); // Log a snippet of the raw msg
+
+        if (!hasDataSubscribers || !msg.type) {
+            console.log(`HSC_HANDLE_MSG: No relevant subscribers or no msg.type. Type: ${msg.type}`);
+            return;
+        }
+
+        let payloadsToProcess: (ActionContent | DeltaContent)[] = [];
+
+        try {
+            if (msg.messages && Array.isArray(msg.messages)) {
+                // Scenario 1: 'messages' is an array of already parsed objects (preferred by some implementations)
+                console.log(`HSC_HANDLE_MSG: Processing msg.messages (array of ${msg.messages.length} objects)`);
+                payloadsToProcess = msg.messages;
+            } else if (typeof msg.message === 'string' && msg.message.trim() !== '') {
+                // Scenario 2: 'message' is a JSON string (common for single items)
+                console.log(`HSC_HANDLE_MSG: Processing msg.message (JSON string)`);
+                const parsedMessage = JSON.parse(msg.message);
+                // The parsed message could be a single object or an array of objects
+                if (Array.isArray(parsedMessage)) {
+                    payloadsToProcess = parsedMessage;
+                } else {
+                    payloadsToProcess = [parsedMessage];
+                }
+            } else if (msg.content) {
+                // Scenario 3: Fallback to 'content' (less common from server, more for direct trigger)
+                console.warn(`HSC_HANDLE_MSG: Processing msg.content (fallback). This might indicate test payload mismatch with server.`);
+                if (Array.isArray(msg.content)) { // If content itself could be an array
+                    payloadsToProcess = msg.content;
+                } else {
+                    payloadsToProcess = [msg.content];
+                }
+            } else {
+                console.log(`HSC_HANDLE_MSG: No processable payload found in msg.messages, msg.message, or msg.content.`);
+                return;
+            }
+
+            if (payloadsToProcess.length > 0) {
+                console.log(`HSC_HANDLE_MSG: Extracted ${payloadsToProcess.length} payloads to process for type: ${msg.type}`);
+                payloadsToProcess.forEach((payload: ActionContent | DeltaContent) => {
                     if (msg.type === 'action_trace') {
-                        this.processActionTrace(messageContent as ActionContent, msg.mode);
+                        this.processActionTrace(payload as ActionContent, msg.mode);
                     } else if (msg.type === 'delta_trace') {
-                        this.processDeltaTrace(messageContent as DeltaContent, msg.mode);
+                        this.processDeltaTrace(payload as DeltaContent, msg.mode);
                     }
                 });
-            } catch (parseError) {
-                console.error("Error parsing incoming message:", parseError, msg.message || msg.messages);
+            } else {
+                console.log(`HSC_HANDLE_MSG: No payloads extracted after checking messages/message/content for type: ${msg.type}`);
             }
+
+        } catch (parseError) {
+            console.error("HSC_HANDLE_MSG: Error during payload extraction or parsing:", parseError, "Original msg:", msg);
         }
     }
 

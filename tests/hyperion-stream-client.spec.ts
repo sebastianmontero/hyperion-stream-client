@@ -12,6 +12,7 @@ import {
   StreamActionsRequest,
   LIBData,
   ForkData,
+  ActionContent,
   // Import other necessary types like StreamActionsRequest if directly used in tests
 } from '../src/interfaces'; // Adjust path as needed
 import {
@@ -29,7 +30,6 @@ jest.mock('socket.io-client');
 jest.mock('cross-fetch');
 
 import { getMockSocket, resetMockSocket, EventHandler } from '../__mocks__/socket.io-client';
-import { tryEach } from 'async';
 
 // Type of your mock socket instance, useful for `mockSocket` variable
 type MockSocketType = ReturnType<typeof getMockSocket>;
@@ -41,30 +41,76 @@ const mockedIo = io as jest.MockedFunction<typeof io>;
 interface LocalMockSocket {
     _name: string;
     connected: boolean;
-    _handlers: Record<string, EventHandler[] | undefined>; // Allow undefined for non-existent event arrays
-
+    _handlers: Record<string, EventHandler[] | undefined>;
     on: jest.Mock<LocalMockSocket, [string, EventHandler]>;
     off: jest.Mock<LocalMockSocket, [string, EventHandler]>;
-
-    // Corrected 'emit' signature:
-    // The 'ack' callback is the last optional argument.
-    // The '...args: any[]' will capture all arguments between 'event' and 'ack'.
-    emit: jest.Mock<void, [event: string, ...args: any[]]>; // The ack is implicitly the last if used
-                                                           // Or, more explicitly, but Jest's tuple typing might need care:
-                                                           // emit: jest.Mock<void, [event: string, ...dataArgs: any[], ack?: (...ackArgs: any[]) => void]>;
-                                                           // Let's try the simpler one first, then refine if needed.
-
+    emit: jest.Mock<void, [event: string, ...args: any[]]>;
     disconnect: jest.Mock<void, []>;
     removeAllListeners: jest.Mock<void, []>;
-    _trigger: jest.Mock<void, [string, ...any[]]>; // _trigger can also take multiple args
+    _trigger: jest.Mock<void, [string, ...any[]]>;
     _simulateSuccessfulConnect: jest.Mock<void, []>;
     _simulateConnectError: jest.Mock<void, [Error]>;
 }
 
+const createLocalMockSocket = (name: string): LocalMockSocket => {
+    const localHandlers: Record<string, EventHandler[]> = {};
+    const mockInst: LocalMockSocket = {
+        _name: name,
+        connected: false,
+        _handlers: localHandlers,
+        on: jest.fn(function(this: LocalMockSocket, event: string, handler: EventHandler) {
+            let handlersForEvent = this._handlers[event];
+            if (!handlersForEvent) {
+                handlersForEvent = [];
+                this._handlers[event] = handlersForEvent;
+            }
+            handlersForEvent.push(handler);
+            return this;
+        }),
+        off: jest.fn(function(this: LocalMockSocket, event: string, handler: EventHandler) {
+            const handlersForEvent = this._handlers[event];
+            if (handlersForEvent) {
+                this._handlers[event] = handlersForEvent.filter(h => h !== handler);
+            }
+            return this;
+        }),
+        emit: jest.fn(function(this: LocalMockSocket, event: string, ...args: any[]) {
+            let ack: Function | undefined;
+            if (args.length > 0 && typeof args[args.length - 1] === 'function') {
+                ack = args.pop() as Function;
+            }
+            if (ack) {
+                if (event === 'action_stream_request' || event === 'delta_stream_request') {
+                    ack({ status: "OK" });
+                } else {
+                    ack();
+                }
+            }
+        }),
+        disconnect: jest.fn(function(this: LocalMockSocket) { this.connected = false; }),
+        removeAllListeners: jest.fn(function(this: LocalMockSocket) {
+            Object.keys(this._handlers).forEach(key => delete this._handlers[key]);
+        }),
+        _trigger: jest.fn(function(this: LocalMockSocket, event: string, ...args: any[]) {
+            const handlersToCall = this._handlers[event];
+            if (handlersToCall && handlersToCall.length > 0) {
+                [...handlersToCall].forEach((h: Function) => { try { h(...args); } catch (e) { console.error(`MOCK_TRIGGER_ERROR (${this._name}, ${event}):`, e);} });
+            }
+        }),
+        _simulateSuccessfulConnect: jest.fn(function(this: LocalMockSocket) {
+            this.connected = true; this._trigger('connect');
+        }),
+        _simulateConnectError: jest.fn(function(this: LocalMockSocket, err: Error) {
+            this.connected = false; this._trigger('connect_error', err); this._trigger('disconnect', 'transport error');
+        })
+    };
+    return mockInst;
+};
+
 
 describe('HyperionStreamClient', () => {
-    let client: HyperionStreamClient; // Type is now non-null within describe blocks that init it
-    let currentMockSocket: MockSocketType; // Holds the global mock socket instance
+    let client: HyperionStreamClient; // To be instantiated in beforeEach of relevant describe blocks or in tests
+    let globalCurrentMockSocket: MockSocketType; // The global mock from __mocks__
 
     const defaultTestOptions: HyperionClientOptions = {
         endpoints: 'ws://default-test-ep.com',
@@ -75,30 +121,28 @@ describe('HyperionStreamClient', () => {
         tryForever: false,
     };
 
-    // General beforeEach for things common to ALL tests
     beforeEach(() => {
         jest.useFakeTimers();
-        resetMockSocket(); // Resets the state of the global mockSocketInstance
-        currentMockSocket = getMockSocket(); // Get the global instance for general use
+        resetMockSocket(); // Resets the state of the global mockSocketInstance from __mocks__
+        globalCurrentMockSocket = getMockSocket(); // Get the global instance
         mockedFetch.mockReset();
-        mockedIo.mockClear(); // Clear call stats and mockImplementation details for io
+        mockedIo.mockClear(); // Clear call stats and mockImplementation details for mockedIo itself
     });
 
-    afterEach(async () => {
-        // client might have been created in a test or a describe-level beforeEach
-        if (client) {
-            client.disconnect();
-        }
-        jest.clearAllTimers();
-        jest.useRealTimers();
-    });
+    // afterEach(async () => {
+    //     if (client) { // client might not be set if a constructor test fails early
+    //         client.disconnect();
+    //     }
+    //     jest.clearAllTimers();
+    //     jest.useRealTimers();
+    // });
 
     // describe('Constructor and Options', () => {
     //     it('should throw an error if no endpoints are provided', () => {
     //         expect(() => new HyperionStreamClient({ ...defaultTestOptions, endpoints: [] }))
     //             .toThrow('Endpoints array cannot be empty.');
-    //         // @ts-ignore testing invalid options
-    //         expect(() => new HyperionStreamClient({ async: false } as HyperionClientOptions)) // Provide a minimal valid-ish structure
+    //         // @ts-ignore
+    //         expect(() => new HyperionStreamClient({ async: false } as HyperionClientOptions))
     //             .toThrow('Endpoints option is required.');
     //     });
 
@@ -124,84 +168,98 @@ describe('HyperionStreamClient', () => {
     //     });
     // });
 
-    // describe('Connection Handling (Single Endpoint)', () => {
-    //     beforeEach(() => {
-    //         // Client is instantiated here, so it's non-null for tests in this block
-    //         client = new HyperionStreamClient(defaultTestOptions);
-    //         // All calls to io() by this client instance will return the global currentMockSocket
-    //         mockedIo.mockReturnValue(currentMockSocket as any);
-    //     });
+    describe('Connection Handling (Single Endpoint)', () => {
+        beforeEach(() => {
+            client = new HyperionStreamClient(defaultTestOptions);
+            // All calls to io() by this client instance will return the globalCurrentMockSocket
+            mockedIo.mockReturnValue(globalCurrentMockSocket as any);
+        });
 
-    //     it('should connect to the endpoint successfully', async () => {
-    //         const connectPromise = client.connect();
-    //         currentMockSocket._simulateSuccessfulConnect();
-    //         await jest.runAllTicks();
-    //         await expect(connectPromise).resolves.toBeUndefined();
-    //         expect(client.online).toBe(true);
-    //         expect(currentMockSocket.on).toHaveBeenCalledWith('connect', expect.any(Function));
-    //     });
+        // it('should connect to the endpoint successfully', async () => {
+        //     const connectPromise = client.connect();
+        //     globalCurrentMockSocket._simulateSuccessfulConnect();
+        //     await jest.runAllTicks();
+        //     await expect(connectPromise).resolves.toBeUndefined();
+        //     expect(client.online).toBe(true);
+        //     expect(globalCurrentMockSocket.on).toHaveBeenCalledWith('connect', expect.any(Function));
+        // });
 
-    //     it('should emit CONNECT event on successful connection', async () => {
-    //         const connectListener = jest.fn();
-    //         client.on(StreamClientEvents.CONNECT, connectListener);
-    //         const connectPromise = client.connect();
-    //         currentMockSocket._simulateSuccessfulConnect();
-    //         await jest.runAllTicks();
-    //         await connectPromise;
-    //         expect(connectListener).toHaveBeenCalledTimes(1);
-    //     });
+        // it('should emit CONNECT event on successful connection', async () => {
+        //     const connectListener = jest.fn();
+        //     client.on(StreamClientEvents.CONNECT, connectListener);
+        //     const connectPromise = client.connect();
+        //     globalCurrentMockSocket._simulateSuccessfulConnect();
+        //     await jest.runAllTicks();
+        //     await connectPromise;
+        //     expect(connectListener).toHaveBeenCalledTimes(1);
+        // });
 
-    //     it('ERR should fail to connect if socket emits connect_error', async () => {
-    //         // Override client for this specific test condition
-    //         client = new HyperionStreamClient({ ...defaultTestOptions, tryForever: false });
-    //         mockedIo.mockReturnValue(currentMockSocket as any); // Ensure this new client also uses the mock
+        // it('ERR should fail to connect if socket emits connect_error', async () => {
+        //     client = new HyperionStreamClient({ ...defaultTestOptions, tryForever: false }); // Re-init for specific option
+        //     mockedIo.mockReturnValue(globalCurrentMockSocket as any); // Ensure this new instance uses the mock
 
-    //         const connectPromise = client.connect();
-    //         currentMockSocket._simulateConnectError();
-    //         await jest.runAllTicks();
-    //         await expect(connectPromise).rejects.toThrow('All configured endpoints failed to connect.');
-    //         expect(client.online).toBe(false);
-    //     });
+        //     const connectPromise = client.connect();
+        //     globalCurrentMockSocket._simulateConnectError();
+        //     await jest.runAllTicks();
+        //     await expect(connectPromise).rejects.toThrow('All configured endpoints failed to connect.');
+        //     expect(client.online).toBe(false);
+        // });
 
-    //     it('disconnect() should make online false and emit DISCONNECT for a connected client', async () => {
-    //         const connectPromise = client.connect();
-    //         currentMockSocket._simulateSuccessfulConnect();
-    //         await jest.runAllTicks();
-    //         await connectPromise;
+        // it('disconnect() should make online false and emit DISCONNECT for a connected client', async () => {
+        //     const connectPromise = client.connect();
+        //     globalCurrentMockSocket._simulateSuccessfulConnect();
+        //     await jest.runAllTicks();
+        //     await connectPromise;
 
-    //         const disconnectListener = jest.fn();
-    //         client.on(StreamClientEvents.DISCONNECT, disconnectListener);
-    //         client.disconnect();
-    //         await jest.runAllTicks(); // Allow disconnect operations to settle
+        //     const disconnectListener = jest.fn();
+        //     client.on(StreamClientEvents.DISCONNECT, disconnectListener);
+        //     client.disconnect();
+        //     await jest.runAllTicks();
 
-    //         expect(client.online).toBe(false);
-    //         expect(currentMockSocket.disconnect).toHaveBeenCalled();
-    //         expect(disconnectListener).toHaveBeenCalledWith({ reason: 'io client disconnect', endpoint: defaultTestOptions.endpoints as string });
-    //     });
+        //     expect(client.online).toBe(false);
+        //     expect(globalCurrentMockSocket.disconnect).toHaveBeenCalled();
+        //     expect(disconnectListener).toHaveBeenCalledWith({ reason: 'io client disconnect', endpoint: defaultTestOptions.endpoints as string });
+        // });
 
-    //     it('ERR disconnect() should abort a pending connect() attempt and reject its promise', async () => {
-    //         const connectPromise = client.connect(); // Don't await, don't simulate connect
-    //         client.disconnect(); // Call disconnect while connect is "pending"
-    //         await expect(connectPromise).rejects.toThrow('Connection attempt aborted by disconnect.');
-    //         expect(client.online).toBe(false);
-    //         console.log('client.online', client.online);
-    //     });
-    // });
+        // it('disconnect() should abort a pending connect() attempt and reject its promise', async () => {
+        //     const connectPromise = client.connect();
+        //     client.disconnect();
+        //     await expect(connectPromise).rejects.toThrow('Connection attempt aborted by disconnect.');
+        //     expect(client.online).toBe(false);
+        // });
+
+        it('disconnect() should abort a pending connect() attempt and reject its promise', async () => {
+            console.log('TEST: Starting "disconnect() should abort..." test');
+            const connectPromise = client.connect();
+            let caughtError: Error | null = null;
+    
+            try {
+                console.log('TEST: Calling client.disconnect()');
+                client.disconnect(); // This will internally call _initialConnectPromiseCallbacks.reject()
+                console.log('TEST: client.disconnect() called. Awaiting connectPromise.');
+                await jest.runAllTicks(); // <<< ADD THIS
+                await jest.runAllTicks(); // <<< ADD THIS
+                await connectPromise; // This line will throw because connectPromise is rejected
+                console.log('TEST: connectPromise resolved unexpectedly (SHOULD NOT HAPPEN)');
+            } catch (error: any) {
+                console.log('TEST: Caught error from awaiting connectPromise:', error.message);
+                caughtError = error;
+            }
+    
+            expect(caughtError).toBeInstanceOf(Error);
+            expect(caughtError?.message).toBe('Connection attempt aborted by disconnect.');
+            expect(client.online).toBe(false);
+            console.log('TEST: Finished "disconnect() should abort..." test');
+        });
+    });
 
     describe('Connection Handling with Failover', () => {
-        // client is instantiated within each test for this block due to complex io mocking
-
-        // it.only('should connect to the second endpoint if the first one fails (tryForever: false)', async () => {
+        // it('should connect to the second endpoint if the first one fails (tryForever: false)', async () => {
         //     const endpoints = ['ws://ep1.com', 'ws://ep2.com'];
         //     client = new HyperionStreamClient({ ...defaultTestOptions, endpoints, tryForever: false });
 
-        //     // Create distinct mock objects for each socket "instance" returned by io()
-        //     const mockSocketEp1 = { ...getMockSocket(), _handlers: {}, on: jest.fn().mockReturnThis(), emit: jest.fn(), disconnect: jest.fn(), removeAllListeners: jest.fn(), _trigger: jest.fn(), connected: false, _simulateConnectError: jest.fn(function(this:any,e:Error){this.connected=false; this._trigger('connect_error',e); this._trigger('disconnect','transport error');}) };
-        //     const mockSocketEp2 = { ...getMockSocket(), _handlers: {}, on: jest.fn().mockReturnThis(), emit: jest.fn(), disconnect: jest.fn(), removeAllListeners: jest.fn(), _trigger: jest.fn(), connected: false, _simulateSuccessfulConnect: jest.fn(function(this:any){this.connected=true; this._trigger('connect');}) };
-        //     // Reset handlers on the mock objects themselves if _handlers is shared from getMockSocket()
-        //     mockSocketEp1._handlers = {};
-        //     mockSocketEp2._handlers = {};
-
+        //     const mockSocketEp1 = createLocalMockSocket('EP1_Socket_Failover1');
+        //     const mockSocketEp2 = createLocalMockSocket('EP2_Socket_Failover1');
 
         //     mockedIo
         //         .mockReturnValueOnce(mockSocketEp1 as any)
@@ -210,13 +268,12 @@ describe('HyperionStreamClient', () => {
         //     const connectPromise = client.connect();
 
         //     // Phase 1: EP1 Fails
-        //     await jest.runAllTicks(); // Allow client.connect() to call io() for ep1 & attach listeners
+        //     await jest.runAllTicks(); // Allow client to call io() for ep1 & attach listeners
         //     expect(mockedIo).toHaveBeenCalledTimes(1);
         //     mockSocketEp1._simulateConnectError(new Error('ep1 failed'));
 
-        //     // Allow client's internal failover logic
-        //     await jest.runAllTicks();
-        //     expect(mockedIo).toHaveBeenCalledTimes(2); // io() called for ep2
+        //     await jest.runAllTicks(); // Allow client's internal failover logic
+        //     expect(mockedIo).toHaveBeenCalledTimes(2);
         //     // @ts-ignore
         //     expect(client.activeEndpointURL).toBe(endpoints[1]);
 
@@ -230,144 +287,14 @@ describe('HyperionStreamClient', () => {
         //     expect(client.activeEndpointURL).toBe(endpoints[1]);
         // });
 
-        it('should connect to the second endpoint if the first one fails (tryForever: false)', async () => {
-            const endpoints = ['ws://ep1.com', 'ws://ep2.com'];
-            client = new HyperionStreamClient({ ...defaultTestOptions, endpoints, tryForever: false });
-        
-            // Create truly distinct mock objects for each socket "instance"
-            const createLocalMockSocket = (): LocalMockSocket => {
-                const localHandlers: Record<string, EventHandler[]> = {};
-                // The object literal will be checked against LocalMockSocket implicitly by the return type.
-                // Or, you can explicitly type mockInst: LocalMockSocket = { ... }
-                const mockInst = {
-                    _name: '',
-                    connected: false,
-                    _handlers: localHandlers,
-            
-                    // Now 'this' can be typed as LocalMockSocket
-                    on: jest.fn(function(this: LocalMockSocket, event: string, handler: EventHandler) {
-                        let handlersForEvent = this._handlers[event]; // Use this._handlers
-                        if (!handlersForEvent) {
-                            handlersForEvent = [];
-                            this._handlers[event] = handlersForEvent;
-                        }
-                        handlersForEvent.push(handler);
-                        console.log(`TEST_MOCK_ON (${this._name}): Registered for '${event}', total now: ${handlersForEvent.length}`);
-                        return this;
-                    }),
-                    off: jest.fn(function(this: LocalMockSocket, event: string, handler: EventHandler) {
-                        const handlersForEvent = this._handlers[event]; // Use this._handlers
-                        if (handlersForEvent) {
-                            this._handlers[event] = handlersForEvent.filter(h => h !== handler);
-                        }
-                        console.log(`TEST_MOCK_OFF (${this._name}): Deregistered for '${event}', total now: ${this._handlers[event]?.length || 0}`);
-                        return this;
-                    }),
-                    emit: jest.fn(function(this: LocalMockSocket, _event: string, _data: any, ack?: Function) {
-                        console.log(`TEST_MOCK_EMIT (${this._name}): Event '${_event}' with ack: ${!!ack}`);
-                        if (ack) ack({status: "OK"});
-                    }),
-                    disconnect: jest.fn(function(this: LocalMockSocket) {
-                        console.log(`TEST_MOCK_DISCONNECT (${this._name}) called`);
-                        this.connected = false;
-                    }),
-                    removeAllListeners: jest.fn(function(this: LocalMockSocket) {
-                        console.log(`TEST_MOCK_REMOVEALLLISTENERS (${this._name}) called`);
-                        // Reset this instance's handlers
-                        Object.keys(this._handlers).forEach(key => delete this._handlers[key]);
-                    }),
-                    _trigger: jest.fn(function(this: LocalMockSocket, event: string, ...args: any[]) {
-                        const handlersToCall = this._handlers[event]; // Use this._handlers
-                        console.log(`TEST_MOCK_TRIGGER (${this._name}): Triggering '${event}'. Handlers: ${handlersToCall?.length || 0}`);
-                        if (handlersToCall && handlersToCall.length > 0) {
-                            console.log(`TEST_MOCK_TRIGGER (${this._name}): Executing ${handlersToCall.length} handlers for "${event}".`);
-                            [...handlersToCall].forEach((h: Function, index: number) => {
-                                console.log(`TEST_MOCK_TRIGGER (${this._name}): Calling handler ${index + 1} for "${event}". Handler: ${h.name || 'anonymous'}`);
-                                try {
-                                    h(...args);
-                                } catch (e) {
-                                    console.error(`TEST_MOCK_TRIGGER_HANDLER_ERROR (${this._name}) during event ${event}:`, e)
-                                }
-                            });
-                        } else {
-                            console.warn(`TEST_MOCK_TRIGGER_WARN (${this._name}): No handlers registered for event "${event}" to trigger.`);
-                        }
-                    }),
-                    _simulateSuccessfulConnect: jest.fn(function(this: LocalMockSocket) {
-                        console.log(`TEST_MOCK_SIM_CONNECT (${this._name})`);
-                        this.connected = true; this._trigger('connect');
-                    }),
-                    _simulateConnectError: jest.fn(function(this: LocalMockSocket, err: Error) {
-                        console.log(`TEST_MOCK_SIM_ERROR (${this._name})`);
-                        this.connected = false; this._trigger('connect_error', err); this._trigger('disconnect', 'transport error');
-                    })
-                };
-                // Ensure the returned object matches the LocalMockSocket interface.
-                // TypeScript will check this implicitly due to the return type annotation on createLocalMockSocket.
-                return mockInst as LocalMockSocket; // Cast if needed, but implicit should work.
-                                                   // More accurately, let the object conform:
-                                                   // const typedMockInst: LocalMockSocket = mockInst; return typedMockInst;
-            };
-        
-            const mockSocketEp1 = createLocalMockSocket();
-            (mockSocketEp1 as any)._name = 'EP1_Socket';
-            const mockSocketEp2 = createLocalMockSocket();
-            (mockSocketEp2 as any)._name = 'EP2_Socket';
-        
-            mockedIo
-                .mockReturnValueOnce(mockSocketEp1 as any)
-                .mockReturnValueOnce(mockSocketEp2 as any);
-        
-            console.log('TEST: Calling client.connect()');
-            const connectPromise = client.connect();
-        
-            // Phase 1: EP1 Fails
-            console.log('TEST: Allowing initial client.connect() activities (ep1 setup)');
-            await jest.runAllTicks();
-            expect(mockedIo).toHaveBeenCalledTimes(1);
-            // @ts-ignore
-            console.log(`TEST: Client state before EP1 fail: online=${client.online}, activeEP=${client.activeEndpointURL}, connectionInProgress=${client.connectionInProgress}`);
-        
-            console.log('TEST: Simulating EP1 failure on mockSocketEp1');
-            mockSocketEp1._simulateConnectError(new Error('ep1 failed'));
-        
-            console.log('TEST: Running ticks after EP1 failure to allow client to switch to EP2');
-            await jest.runAllTicks();
-            // @ts-ignore
-            console.log(`TEST: Client state after EP1 fail ticks: online=${client.online}, activeEP=${client.activeEndpointURL}, connectionInProgress=${client.connectionInProgress}`);
-        
-            expect(mockedIo).toHaveBeenCalledTimes(2); // Expect io() called for ep2
-            // @ts-ignore
-            expect(client.activeEndpointURL).toBe(endpoints[1]);
-        
-            // Phase 2: EP2 Succeeds
-            console.log('TEST: Simulating EP2 success on mockSocketEp2');
-            mockSocketEp2._simulateSuccessfulConnect();
-        
-            console.log('TEST: Running ticks after EP2 success');
-            await jest.runAllTicks();
-            // @ts-ignore
-            console.log(`TEST: Client state after EP2 success ticks: online=${client.online}, activeEP=${client.activeEndpointURL}, connectionInProgress=${client.connectionInProgress}`);
-        
-            console.log('TEST: Awaiting connectPromise resolution');
-            await expect(connectPromise).resolves.toBeUndefined();
-        
-            console.log('TEST: connectPromise resolved.');
-            expect(client.online).toBe(true);
-            // @ts-ignore
-            expect(client.activeEndpointURL).toBe(endpoints[1]);
-        });
-
-        // it('should emit ALL_ENDPOINTS_FAILED if all endpoints fail and not tryForever', async () => {
+        // it('ERR should emit ALL_ENDPOINTS_FAILED if all endpoints fail and not tryForever', async () => {
         //     const endpoints = ['ws://ep1.com', 'ws://ep2.com'];
         //     client = new HyperionStreamClient({ ...defaultTestOptions, endpoints, tryForever: false });
         //     const allFailedListener = jest.fn();
         //     client.on(StreamClientEvents.ALL_ENDPOINTS_FAILED, allFailedListener);
 
-        //     const mockSocketEp1 = { ...getMockSocket(), _handlers: {}, on: jest.fn().mockReturnThis(), emit: jest.fn(), disconnect: jest.fn(), removeAllListeners: jest.fn(), _trigger: jest.fn(), connected: false, _simulateConnectError: jest.fn(function(this:any,e:Error){this.connected=false; this._trigger('connect_error',e);this._trigger('disconnect','transport error');}) };
-        //     const mockSocketEp2 = { ...getMockSocket(), _handlers: {}, on: jest.fn().mockReturnThis(), emit: jest.fn(), disconnect: jest.fn(), removeAllListeners: jest.fn(), _trigger: jest.fn(), connected: false, _simulateConnectError: jest.fn(function(this:any,e:Error){this.connected=false; this._trigger('connect_error',e);this._trigger('disconnect','transport error');}) };
-        //     mockSocketEp1._handlers = {}; // Ensure clean handlers
-        //     mockSocketEp2._handlers = {};
+        //     const mockSocketEp1 = createLocalMockSocket('EP1_Socket_AllFail');
+        //     const mockSocketEp2 = createLocalMockSocket('EP2_Socket_AllFail');
 
         //     mockedIo
         //         .mockReturnValueOnce(mockSocketEp1 as any)
@@ -385,59 +312,61 @@ describe('HyperionStreamClient', () => {
         //     await expect(connectPromise).rejects.toThrow('All configured endpoints failed to connect.');
         //     expect(allFailedListener).toHaveBeenCalledWith({ endpoints });
         //     expect(client.online).toBe(false);
+        //     expect(mockedIo).toHaveBeenCalledTimes(2);
+        //     console.log('End of emit ALL_ENDPOINTS_FAILED test');
         // });
 
         // it('should attempt to reconnect on disconnect if tryForever is true', async () => {
         //     client = new HyperionStreamClient({ ...defaultTestOptions, endpoints: ['ws://ep1.com'], tryForever: true, reconnectDelay: 100 });
 
-        //     const mockSocket1 = { ...getMockSocket(), _handlers: {}, on: jest.fn().mockReturnThis(), emit: jest.fn(), disconnect: jest.fn(), removeAllListeners: jest.fn(), _trigger: jest.fn(), connected: false, _simulateSuccessfulConnect: jest.fn(function(this:any){this.connected=true; this._trigger('connect');}) };
-        //     const mockSocket2 = { ...getMockSocket(), _handlers: {}, on: jest.fn().mockReturnThis(), emit: jest.fn(), disconnect: jest.fn(), removeAllListeners: jest.fn(), _trigger: jest.fn(), connected: false, _simulateSuccessfulConnect: jest.fn(function(this:any){this.connected=true; this._trigger('connect');}) };
-        //     mockSocket1._handlers = {}; // Ensure clean handlers
-        //     mockSocket2._handlers = {};
+        //     const mockSocket1 = createLocalMockSocket('EP1_Socket_TryForever1');
+        //     const mockSocket2 = createLocalMockSocket('EP1_Socket_TryForever2_Reconnect'); // For reconnect attempt
 
         //     mockedIo
-        //         .mockReturnValueOnce(mockSocket1 as any) // For initial connect
-        //         .mockReturnValueOnce(mockSocket2 as any); // For reconnect attempt
+        //         .mockReturnValueOnce(mockSocket1 as any)
+        //         .mockReturnValueOnce(mockSocket2 as any);
 
+        //     // Initial connection
         //     const initialConnectPromise = client.connect();
-        //     await jest.runAllTicks(); // io for ep1
+        //     await jest.runAllTicks(); // io for mockSocket1
         //     mockSocket1._simulateSuccessfulConnect();
         //     await jest.runAllTicks(); // Process connect
         //     await initialConnectPromise;
         //     expect(client.online).toBe(true);
 
-        //     mockSocket1._trigger('disconnect', 'transport error'); // client uses mockSocket1
+        //     // Simulate server/network initiated disconnect
+        //     mockSocket1._trigger('disconnect', 'transport error'); // client was using mockSocket1
         //     await jest.runAllTicks(); // Process disconnect event
         //     expect(client.online).toBe(false);
 
-        //     jest.advanceTimersByTime(100); // For reconnectDelay
-        //     await jest.runAllTicks(); // Process _scheduleReconnect -> _attemptNextConnection -> io for ep2
+        //     // Advance timer for reconnectDelay
+        //     jest.advanceTimersByTime(100);
+        //     await jest.runAllTicks(); // Process _scheduleReconnect -> _attemptNextConnection -> io for mockSocket2
         //     expect(mockedIo).toHaveBeenCalledTimes(2);
 
+        //     // Simulate reconnect success
         //     mockSocket2._simulateSuccessfulConnect(); // client now uses mockSocket2
         //     await jest.runAllTicks(); // Process connect
         //     expect(client.online).toBe(true);
         // });
     });
 
-
     // describe('Request Handling', () => {
     //     const actionRequest: StreamActionsRequest = { contract: 'eosio.token', action: 'transfer', account: 'testacc', filters: [], start_from:0, read_until:0 };
 
     //     beforeEach(async () => {
     //         client = new HyperionStreamClient(defaultTestOptions);
-    //         // Ensure this client uses the global currentMockSocket for its single connection
-    //         mockedIo.mockReturnValue(currentMockSocket as any);
+    //         mockedIo.mockReturnValue(globalCurrentMockSocket as any);
     //         const p = client.connect();
-    //         currentMockSocket._simulateSuccessfulConnect();
+    //         globalCurrentMockSocket._simulateSuccessfulConnect();
     //         await jest.runAllTicks();
     //         await p;
     //     });
 
     //     it('should send streamActions request when connected', async () => {
-    //         currentMockSocket.emit.mockImplementationOnce((_event, _data, ack) => ack({ status: 'OK' }));
+    //         globalCurrentMockSocket.emit.mockImplementationOnce((_event, _data, ack) => ack({ status: 'OK' }));
     //         await client.streamActions(actionRequest);
-    //         expect(currentMockSocket.emit).toHaveBeenCalledWith('action_stream_request', expect.objectContaining(actionRequest), expect.any(Function));
+    //         expect(globalCurrentMockSocket.emit).toHaveBeenCalledWith('action_stream_request', expect.objectContaining(actionRequest), expect.any(Function));
     //         // @ts-ignore
     //         expect(client.savedRequests.length).toBe(1);
     //     });
@@ -453,33 +382,31 @@ describe('HyperionStreamClient', () => {
     //     });
 
     //     it('should resend saved requests upon reconnection', async () => {
-    //         currentMockSocket.emit.mockImplementationOnce((_e, _d, ack) => ack({ status: 'OK' }));
+    //         globalCurrentMockSocket.emit.mockImplementationOnce((_e, _d, ack) => ack({ status: 'OK' }));
     //         await client.streamActions(actionRequest);
     //         // @ts-ignore
     //         expect(client.savedRequests.length).toBe(1);
-    //         currentMockSocket.emit.mockClear();
+    //         globalCurrentMockSocket.emit.mockClear();
 
     //         // @ts-ignore Enable auto-reconnect for this test
     //         client.options.tryForever = true;
     //         // @ts-ignore
     //         client.options.reconnectDelay = 50;
 
-    //         currentMockSocket._trigger('disconnect', 'transport error');
+    //         globalCurrentMockSocket._trigger('disconnect', 'transport error');
     //         await jest.runAllTicks();
     //         expect(client.online).toBe(false);
 
-    //         // Setup for the io() call during reconnect
-    //         const mockSocketForReconnect = { ...getMockSocket(), _handlers: {}, on: jest.fn().mockReturnThis(), emit: jest.fn(), _simulateSuccessfulConnect: jest.fn(function(this:any){this.connected=true; this._trigger('connect');}) };
-    //         mockSocketForReconnect._handlers = {}; // Ensure clean handlers
-    //         mockedIo.mockReturnValueOnce(mockSocketForReconnect as any); // Next call to io() gets this
+    //         const mockSocketForReconnect = createLocalMockSocket('ReconnectSocket_Req');
+    //         mockedIo.mockReturnValueOnce(mockSocketForReconnect as any);
 
     //         jest.advanceTimersByTime(50);
-    //         await jest.runAllTicks(); // For _scheduleReconnect -> _attemptNextConnection -> io()
+    //         await jest.runAllTicks();
 
-    //         expect(mockedIo).toHaveBeenCalledTimes(2); // Initial connect + 1 reconnect attempt
+    //         expect(mockedIo).toHaveBeenCalledTimes(2);
     //         mockSocketForReconnect.emit.mockImplementationOnce((_e, _d, ack) => ack({ status: 'OK' }));
     //         mockSocketForReconnect._simulateSuccessfulConnect();
-    //         await jest.runAllTicks(); // For onConnect + resendRequests
+    //         await jest.runAllTicks();
 
     //         expect(client.online).toBe(true);
     //         expect(mockSocketForReconnect.emit).toHaveBeenCalledWith('action_stream_request', expect.objectContaining(actionRequest), expect.any(Function));
@@ -490,31 +417,31 @@ describe('HyperionStreamClient', () => {
     //             ok: true, json: async () => ({ last_irreversible_block_num: 12345 }),
     //         } as Response);
     //         const libRequest = { ...actionRequest, start_from: 'LIB' };
-    //         currentMockSocket.emit.mockImplementationOnce((_e, _d, ack) => ack({ status: 'OK' }));
+    //         globalCurrentMockSocket.emit.mockImplementationOnce((_e, _d, ack) => ack({ status: 'OK' }));
     //         await client.streamActions(libRequest);
     //         await jest.runAllTicks();
     //         expect(mockedFetch).toHaveBeenCalledWith(`${defaultTestOptions.endpoints}/v1/chain/get_info`);
-    //         expect(currentMockSocket.emit).toHaveBeenCalledWith('action_stream_request', expect.objectContaining({ start_from: 12345 }), expect.any(Function));
+    //         expect(globalCurrentMockSocket.emit).toHaveBeenCalledWith('action_stream_request', expect.objectContaining({ start_from: 12345 }), expect.any(Function));
     //     });
 
     //     it('should adjust start_from if lower than lastReceivedBlock', async () => {
     //         // @ts-ignore
     //         client.lastReceivedBlock = 200;
     //         const lowStartRequest = { ...actionRequest, start_from: 100 };
-    //         currentMockSocket.emit.mockImplementationOnce((_e, _d, ack) => ack({ status: 'OK' }));
+    //         globalCurrentMockSocket.emit.mockImplementationOnce((_e, _d, ack) => ack({ status: 'OK' }));
     //         await client.streamActions(lowStartRequest);
     //         await jest.runAllTicks();
-    //         expect(currentMockSocket.emit).toHaveBeenCalledWith('action_stream_request', expect.objectContaining({ start_from: 200 }), expect.any(Function));
+    //         expect(globalCurrentMockSocket.emit).toHaveBeenCalledWith('action_stream_request', expect.objectContaining({ start_from: 200 }), expect.any(Function));
     //     });
 
     //     it('should disconnect if read_until is met by LIB', async () => {
     //         const disconnectSpy = jest.spyOn(client, 'disconnect');
     //         const readUntilRequest = { ...actionRequest, read_until: 100 };
-    //         currentMockSocket.emit.mockImplementationOnce((_e, _d, ack) => ack({ status: 'OK' }));
+    //         globalCurrentMockSocket.emit.mockImplementationOnce((_e, _d, ack) => ack({ status: 'OK' }));
     //         await client.streamActions(readUntilRequest);
     //         await jest.runAllTicks();
 
-    //         currentMockSocket._trigger('lib_update', { chain_id: 'test', block_num: 101, block_id: 'abc' } as LIBData);
+    //         globalCurrentMockSocket._trigger('lib_update', { chain_id: 'test', block_num: 101, block_id: 'abc' } as LIBData);
     //         await jest.runAllTicks();
 
     //         expect(disconnectSpy).toHaveBeenCalled();
@@ -523,144 +450,379 @@ describe('HyperionStreamClient', () => {
     // });
 
     // describe('Data and Event Handling', () => {
-    //     const mockActionPayload: any = {
-    //         '@timestamp': new Date().toISOString(),
-    //         act: { name: 'testaction', account: 'testcontract', data: { memo: 'hello' } },
-    //         block_num: 100, global_sequence: 1, account_ram_deltas: {}, action_ordinal: 1,
-    //         creator_action_ordinal: 0, cpu_usage_us: 0, net_usage_words: 0,
-    //         code_sequence:1, abi_sequence:1, trx_id: 'testtrx', producer: 'testprod', notified: 'testacc'
+    //     // Define a detailed mockActionPayload based on your ActionContent interface
+    //     // Assuming ActionContent expects act.authorization to be a single object
+    //     const completeMockActionPayload: ActionContent = {
+    //         '@timestamp': new Date('2023-01-01T12:00:00.000Z').toISOString(),
+    //         act: {
+    //             account: 'testcontract',
+    //             name: 'testaction',
+    //             authorization: { actor: 'testuser', permission: 'active' }, // << KEY CHANGE: Now a single object
+    //             data: { memo: 'hello from test', value: 123 },
+    //         },
+    //         block_num: 100,
+    //         global_sequence: 12345,
+    //         // Assuming account_ram_deltas is a single object as per your current ActionContent structure
+    //         account_ram_deltas: { delta: 10, account: 'testuser' },
+    //         action_ordinal: 1,
+    //         creator_action_ordinal: 0,
+    //         cpu_usage_us: 150,
+    //         net_usage_words: 32,
+    //         code_sequence: 1,
+    //         abi_sequence: 1,
+    //         trx_id: 'testtrxid001',
+    //         producer: 'eosproducer',
+    //         // Assuming notified is a single string as per your current ActionContent structure
+    //         notified: 'testcontract',
     //     };
-
+    
+    //     const anotherMockActionPayload: ActionContent = {
+    //         ...completeMockActionPayload, // Base it on the first one
+    //         block_num: 101, // Different block
+    //         global_sequence: 12346,
+    //         trx_id: 'testtrxid002',
+    //         act: {
+    //             ...completeMockActionPayload.act, // Inherit account, name
+    //             authorization: { actor: 'anotheruser', permission: 'owner' }, // << KEY CHANGE: Single object
+    //             data: { memo: 'another action', value: 456 },
+    //         },
+    //         // Adjust other fields if they should vary for the second payload
+    //         notified: 'anothercontract',
+    //     };
+    
+    
     //     beforeEach(async () => {
+    //         // Client for this block will have async: true by default in options
     //         client = new HyperionStreamClient({ ...defaultTestOptions, async: true });
-    //         mockedIo.mockReturnValue(currentMockSocket as any);
+    //         mockedIo.mockReturnValue(globalCurrentMockSocket as any);
+    
     //         const p = client.connect();
-    //         currentMockSocket._simulateSuccessfulConnect();
+    //         globalCurrentMockSocket._simulateSuccessfulConnect();
     //         await jest.runAllTicks();
     //         await p;
     //     });
-
-    //     it('should process action trace and call onDataAsync handler', async () => {
+    
+    //     it('should process a single action trace (from "message" string) and call onDataAsync handler', async () => {
     //         const dataHandler = jest.fn().mockResolvedValue(undefined);
     //         client.setAsyncDataHandler(dataHandler);
-
-    //         currentMockSocket._trigger('message', { type: 'action_trace', mode: 'live', content: mockActionPayload });
+    
+    //         const serverMessage = {
+    //             type: 'action_trace',
+    //             mode: 'live',
+    //             message: JSON.stringify(completeMockActionPayload)
+    //         };
+    
+    //         globalCurrentMockSocket._trigger('message', serverMessage);
     //         await jest.runAllTicks();
-
+    
     //         expect(dataHandler).toHaveBeenCalledTimes(1);
     //         expect(dataHandler).toHaveBeenCalledWith(expect.objectContaining({
-    //             type: 'action', content: expect.objectContaining(mockActionPayload), irreversible: false
+    //             type: 'action',
+    //             mode: 'live',
+    //             content: expect.objectContaining(completeMockActionPayload),
+    //             irreversible: false
     //         }));
     //         // @ts-ignore
-    //         expect(client.lastReceivedBlock).toBe(100);
+    //         expect(client.lastReceivedBlock).toBe(completeMockActionPayload.block_num);
     //     });
-
-    //     it('should emit DATA event for action trace', (done) => {
+    
+    //     it('should process multiple action traces (from "messages" array) and call onDataAsync handler for each', async () => {
+    //         const dataHandler = jest.fn().mockResolvedValue(undefined);
+    //         client.setAsyncDataHandler(dataHandler);
+    
+    //         const serverMessage = {
+    //             type: 'action_trace',
+    //             mode: 'history',
+    //             messages: [completeMockActionPayload, anotherMockActionPayload] // Array of valid ActionContent objects
+    //         };
+    
+    //         globalCurrentMockSocket._trigger('message', serverMessage);
+    //         console.log('TEST: Message triggered with 2 actions.');
+    //         await jest.runAllTicks(); // For first item's onDataAsync promise
+    //         console.log('TEST: First runAllTicks done.');
+    //         await jest.runAllTicks(); // For second item's onDataAsync promise, if queue picked it up
+    //         console.log('TEST: Second runAllTicks done.');
+    
+    //         expect(dataHandler).toHaveBeenCalledTimes(2);
+    //         expect(dataHandler).toHaveBeenCalledWith(expect.objectContaining({
+    //             type: 'action',
+    //             mode: 'history',
+    //             content: expect.objectContaining(completeMockActionPayload),
+    //         }));
+    //         expect(dataHandler).toHaveBeenCalledWith(expect.objectContaining({
+    //             type: 'action',
+    //             mode: 'history',
+    //             content: expect.objectContaining(anotherMockActionPayload),
+    //         }));
+    //         // @ts-ignore
+    //         expect(client.lastReceivedBlock).toBe(anotherMockActionPayload.block_num);
+    //     });
+    
+    //     it('should emit DATA event for a single action trace (from "message" string)', (done) => {
     //         client.on(StreamClientEvents.DATA, (data) => {
     //             expect(data).toEqual(expect.objectContaining({
-    //                 type: 'action', content: expect.objectContaining(mockActionPayload)
+    //                 type: 'action',
+    //                 mode: 'history',
+    //                 content: expect.objectContaining(completeMockActionPayload)
     //             }));
     //             done();
     //         });
-    //         currentMockSocket._trigger('message', { type: 'action_trace', mode: 'history', content: mockActionPayload });
+    
+    //         const serverMessage = {
+    //             type: 'action_trace',
+    //             mode: 'history',
+    //             message: JSON.stringify(completeMockActionPayload)
+    //         };
+    //         globalCurrentMockSocket._trigger('message', serverMessage);
     //     });
-
+    
+    //     it('should emit DATA events for multiple action traces (from "messages" array)', (done) => {
+    //         const expectedPayloads = [completeMockActionPayload, anotherMockActionPayload];
+    //         let receivedCount = 0;
+    
+    //         client.on(StreamClientEvents.DATA, (data) => {
+    //             expect(data).toEqual(expect.objectContaining({
+    //                 type: 'action',
+    //                 mode: 'live',
+    //                 content: expect.objectContaining(expectedPayloads[receivedCount]),
+    //             }));
+    //             receivedCount++;
+    //             if (receivedCount === expectedPayloads.length) {
+    //                 done();
+    //             }
+    //         });
+    
+    //         const serverMessage = {
+    //             type: 'action_trace',
+    //             mode: 'live',
+    //             messages: expectedPayloads
+    //         };
+    //         globalCurrentMockSocket._trigger('message', serverMessage);
+    //     });
+    
+    
     //     it('should handle LIB updates and process reversible buffer if libStream is true', async () => {
-    //         client.disconnect(); // Disconnect previous client
+    //         if (client) client.disconnect(); // Disconnect client from outer beforeEach
     //         await jest.runAllTicks();
-
+    
     //         client = new HyperionStreamClient({ ...defaultTestOptions, libStream: true, async: true });
-    //         resetMockSocket(); // Reset global mock state for the new client
-    //         currentMockSocket = getMockSocket(); // Get the fresh mock
-    //         mockedIo.mockReturnValue(currentMockSocket as any); // New client uses this fresh mock
-
-    //         const p = client.connect();
-    //         currentMockSocket._simulateSuccessfulConnect();
+    //         resetMockSocket();
+    //         globalCurrentMockSocket = getMockSocket();
+    //         mockedIo.mockReturnValue(globalCurrentMockSocket as any);
+    
+    //         const connectPromise = client.connect();
+    //         globalCurrentMockSocket._simulateSuccessfulConnect();
     //         await jest.runAllTicks();
-    //         await p;
-
+    //         await connectPromise;
+    
     //         const libDataHandler = jest.fn().mockResolvedValue(undefined);
     //         client.setAsyncLibDataHandler(libDataHandler);
     //         const dataHandler = jest.fn().mockResolvedValue(undefined);
     //         client.setAsyncDataHandler(dataHandler);
-
-    //         const reversibleAction = { ...mockActionPayload, block_num: 100 };
-    //         currentMockSocket._trigger('message', { type: 'action_trace', mode: 'live', content: reversibleAction });
-    //         await jest.runAllTicks(); // Process dataQueue
-
-    //         expect(dataHandler).toHaveBeenCalledWith(expect.objectContaining({ content: reversibleAction, irreversible: false }));
+    
+    //         const reversibleAction = { ...completeMockActionPayload, block_num: 100 }; // Uses updated payload
+    //         globalCurrentMockSocket._trigger('message', {
+    //             type: 'action_trace',
+    //             mode: 'live',
+    //             message: JSON.stringify(reversibleAction)
+    //         });
+    //         await jest.runAllTicks();
+    
+    //         expect(dataHandler).toHaveBeenCalledWith(expect.objectContaining({
+    //             content: reversibleAction,
+    //             irreversible: false
+    //         }));
     //         // @ts-ignore
     //         expect(client.reversibleBuffer.length).toBe(1);
-
-    //         currentMockSocket._trigger('lib_update', { chain_id: 'test', block_num: 100, block_id: 'abc' } as LIBData);
-    //         await jest.runAllTicks(); // Process libDataQueue
-    //         await jest.runAllTicks(); // Extra tick
-
-    //         expect(libDataHandler).toHaveBeenCalledWith(expect.objectContaining({ content: reversibleAction, irreversible: true }));
+    
+    //         const libUpdateData: LIBData = { chain_id: 'testchain', block_num: 100, block_id: 'block100id' };
+    //         globalCurrentMockSocket._trigger('lib_update', libUpdateData);
+    //         await jest.runAllTicks();
+    //         await jest.runAllTicks();
+    
+    //         expect(libDataHandler).toHaveBeenCalledWith(expect.objectContaining({
+    //             content: reversibleAction,
+    //             irreversible: true
+    //         }));
     //         // @ts-ignore
     //         expect(client.reversibleBuffer.length).toBe(0);
     //     });
-
-    //     it('once listener should only be called once', async () => {
+    
+    //     it('once listener should only be called once for a triggered event', async () => {
     //         const onceListener = jest.fn();
     //         client.once(StreamClientEvents.FORK, onceListener);
-    //         const forkData: ForkData = { chain_id: 't', starting_block: 1, ending_block: 0, new_id: 'b'};
-
-    //         currentMockSocket._trigger('fork_event', forkData);
+    //         const forkData: ForkData = { chain_id: 'testchain', starting_block: 1, ending_block: 0, new_id: 'new_block_id_b'};
+    
+    //         globalCurrentMockSocket._trigger('fork_event', forkData);
     //         await jest.runAllTicks();
-    //         currentMockSocket._trigger('fork_event', forkData);
+    //         globalCurrentMockSocket._trigger('fork_event', forkData);
     //         await jest.runAllTicks();
-
+    
     //         expect(onceListener).toHaveBeenCalledTimes(1);
     //         expect(onceListener).toHaveBeenCalledWith(forkData);
     //     });
-
-    //     it('off should remove listener', async () => {
-    //         const listener = jest.fn();
-    //         client.on(StreamClientEvents.FORK, listener);
-    //         client.off(StreamClientEvents.FORK, listener);
-
-    //         currentMockSocket._trigger('fork_event', { chain_id: 't', starting_block: 1, ending_block: 0, new_id: 'b'} as ForkData);
+    
+    //     it('off should remove a previously registered listener', async () => {
+    //         const listenerToRemove = jest.fn();
+    //         client.on(StreamClientEvents.FORK, listenerToRemove);
+    //         client.off(StreamClientEvents.FORK, listenerToRemove);
+    
+    //         const forkData: ForkData = { chain_id: 'testchain', starting_block: 1, ending_block: 0, new_id: 'new_block_id_c'};
+    //         globalCurrentMockSocket._trigger('fork_event', forkData);
     //         await jest.runAllTicks();
-    //         expect(listener).not.toHaveBeenCalled();
+    
+    //         expect(listenerToRemove).not.toHaveBeenCalled();
+    //     });
+    
+    //     it('should correctly parse action with metaKey processing when authorization is an object', async () => {
+    //         const dataHandler = jest.fn().mockResolvedValue(undefined);
+    //         client.setAsyncDataHandler(dataHandler);
+    
+    //         // Assuming ActionContent expects act.authorization to be a single object
+    //         const actionWithMeta = { // Type as 'any' for test data flexibility if not matching ActionContent exactly before processing
+    //             '@timestamp': new Date('2023-01-01T12:01:00.000Z').toISOString(),
+    //             act: {
+    //                 account: 'test.token',
+    //                 name: 'transfer',
+    //                 authorization: {actor: 'usera', permission: 'active'}, // << KEY CHANGE: Now a single object
+    //                 data: { from_original: 'original_value' }
+    //             },
+    //             block_num: 200,
+    //             global_sequence: 12347,
+    //             // Assuming account_ram_deltas and notified are single objects/strings as per your interface
+    //             account_ram_deltas: {delta:0, account:'usera'},
+    //             action_ordinal: 1,
+    //             creator_action_ordinal: 0,
+    //             cpu_usage_us: 10,
+    //             net_usage_words: 2,
+    //             code_sequence:1,
+    //             abi_sequence:1,
+    //             trx_id: 'testtrxid003',
+    //             producer: 'eosproducer',
+    //             notified: 'test.token',
+    //             '@transfer': { // The special metaKey
+    //                 from: 'userfrom',
+    //                 to: 'userto',
+    //                 quantity: '1.0000 EOS',
+    //                 memo: 'meta memo'
+    //             }
+    //         } as any; // Using 'as any' because @transfer is not part of ActionContent strictly
+    
+    //         const serverMessage = {
+    //             type: 'action_trace',
+    //             mode: 'live',
+    //             message: JSON.stringify(actionWithMeta)
+    //         };
+    
+    //         globalCurrentMockSocket._trigger('message', serverMessage);
+    //         await jest.runAllTicks();
+    
+    //         expect(dataHandler).toHaveBeenCalledTimes(1);
+    //         const expectedProcessedData = {
+    //             from_original: 'original_value',
+    //             from: 'userfrom',
+    //             to: 'userto',
+    //             quantity: '1.0000 EOS',
+    //             memo: 'meta memo'
+    //         };
+    //         expect(dataHandler).toHaveBeenCalledWith(expect.objectContaining({
+    //             content: expect.objectContaining({
+    //                 act: expect.objectContaining({
+    //                     name: 'transfer',
+    //                     account: 'test.token',
+    //                     data: expectedProcessedData,
+    //                     authorization: {actor: 'usera', permission: 'active'} // Verify processed auth
+    //                 }),
+    //                 // Verify other fields if necessary
+    //                 block_num: 200
+    //             })
+    //         }));
     //     });
     // });
 
     // describe('LIB Activity Timeout', () => {
-    //     beforeEach(async () => {
+    //     it('should attempt a reconnect cycle if no lib_update is received (even if tryForever is false)', async () => {
+    //         const endpoints = ['ws://ep1.com', 'ws://ep2.com'];
+    //         // Create client specifically for this test
     //         client = new HyperionStreamClient({
     //             ...defaultTestOptions,
+    //             endpoints,
     //             libActivityTimeoutMs: 1000,
+    //             tryForever: false,
+    //             reconnectDelay: 50,
     //         });
-    //         mockedIo.mockReturnValue(currentMockSocket as any);
+    
+    //         const mockSocketInitial = createLocalMockSocket('LibTimeout_Initial_Connect_For_Test');
+    //         const mockSocketCycleAttempt = createLocalMockSocket('LibTimeout_Cycle_Attempt_For_Test');
+    
+    //         // Clear any previous global io mocks and set for this test
+    //         mockedIo.mockClear().mockReset(); // Full reset of mockedIo
+    //         mockedIo
+    //             .mockReturnValueOnce(mockSocketInitial as any)
+    //             .mockReturnValueOnce(mockSocketCycleAttempt as any);
+    
+    //         // 1. Connect successfully
     //         const connectPromise = client.connect();
-    //         currentMockSocket._simulateSuccessfulConnect();
+    //         await jest.runAllTicks(); // Allow first io() call
+    //         mockSocketInitial._simulateSuccessfulConnect();
     //         await jest.runAllTicks();
     //         await connectPromise;
-    //     });
-
-    //     it('should disconnect if no lib_update is received', async () => {
-    //         const disconnectSpy = jest.spyOn(currentMockSocket, 'disconnect');
+    //         expect(client.online).toBe(true);
+    //         console.log('TEST_LIB_TIMEOUT: After initial connect, mockedIo calls:', mockedIo.mock.calls.length);
+    //         const initialIoCallCount = mockedIo.mock.calls.length; // Should be 1
+    
     //         const timeoutListener = jest.fn();
     //         client.on(StreamClientEvents.LIBACTIVITY_TIMEOUT, timeoutListener);
-
+    
+    //         // 2. Let libActivityTimeoutMs pass
     //         jest.advanceTimersByTime(1000);
-    //         await jest.runAllTicks();
-
+    //         await jest.runAllTicks(); // Allow timeout cb -> socket.disconnect() -> onSocketDisconnect -> new _attemptNextConnection
+    
     //         expect(timeoutListener).toHaveBeenCalledTimes(1);
-    //         expect(disconnectSpy).toHaveBeenCalled();
-    //     });
-
-    //     it('should reset lib activity timer on lib_update', async () => {
-    //         const disconnectSpy = jest.spyOn(currentMockSocket, 'disconnect');
-
-    //         jest.advanceTimersByTime(500);
-    //         currentMockSocket._trigger('lib_update', { chain_id: 'test', block_num: 10, block_id: 'def' } as LIBData);
+    //         expect(mockSocketInitial.disconnect).toHaveBeenCalled(); // Original socket was told to disconnect
+    //         expect(client.online).toBe(false);
+    
+    //         // 3. Assert that a reconnect attempt was made
+    //         console.log('TEST_LIB_TIMEOUT: Before final expect, mockedIo calls:', mockedIo.mock.calls.length);
+    //         expect(mockedIo).toHaveBeenCalledTimes(initialIoCallCount + 1); // Expects 1 + 1 = 2 calls total
+    
+    //         // @ts-ignore Determine which endpoint it should try for the reconnect cycle
+    //         const expectedReconnectEndpoint = endpoints[client.currentEndpointIndex];
+    //         // @ts-ignore
+    //         expect(client.activeEndpointURL).toBe(expectedReconnectEndpoint);
+    
+    //         // 4. (Optional) Simulate success of this reconnect attempt
+    //         mockSocketCycleAttempt._simulateSuccessfulConnect();
     //         await jest.runAllTicks();
-
+    //         expect(client.online).toBe(true);
+    //         // @ts-ignore
+    //         expect(client.activeEndpointURL).toBe(expectedReconnectEndpoint);
+    //     });
+    
+    //     it('should reset lib activity timer on lib_update', async () => {
+    //         // Create client specifically for this test
+    //         client = new HyperionStreamClient({ ...defaultTestOptions, libActivityTimeoutMs: 1000 });
+    //         // This test uses the global mock socket for simplicity as it's a single connection
+    //         resetMockSocket(); // Ensure global mock is clean
+    //         const libTestSocket = getMockSocket();
+    //         mockedIo.mockClear().mockReset().mockReturnValue(libTestSocket as any);
+    
+    
+    //         const connectPromise = client.connect();
+    //         await jest.runAllTicks();
+    //         libTestSocket._simulateSuccessfulConnect();
+    //         await jest.runAllTicks();
+    //         await connectPromise;
+    
+    //         const disconnectSpy = jest.spyOn(libTestSocket, 'disconnect');
+    
+    //         jest.advanceTimersByTime(500);
+    //         libTestSocket._trigger('lib_update', { chain_id: 'test', block_num: 10, block_id: 'def' } as LIBData);
+    //         await jest.runAllTicks();
+    
     //         jest.advanceTimersByTime(500);
     //         expect(disconnectSpy).not.toHaveBeenCalled();
-
+    
     //         jest.advanceTimersByTime(500);
     //         await jest.runAllTicks();
     //         expect(disconnectSpy).toHaveBeenCalled();
