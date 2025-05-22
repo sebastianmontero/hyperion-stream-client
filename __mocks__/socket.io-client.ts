@@ -14,7 +14,6 @@ interface MockSocket {
     _simulateConnectError: (error?: Error) => void;
     _simulateSuccessfulConnect: () => void;
     _handlers: Record<string, EventHandler[]>; // <<< ADDED THIS LINE
-    hola: string
 }
 
 const mockSocketInstance: MockSocket = {
@@ -47,10 +46,14 @@ const mockSocketInstance: MockSocket = {
         }
     }),
     disconnect: jest.fn(() => {
+        console.log('MOCK_SOCKET_DISCONNECT: Disconnecting socket...');
         if (mockSocketInstance.connected) {
+            console.log('MOCK_SOCKET_DISCONNECT: Socket was connected. Triggering disconnect event.');
             mockSocketInstance.connected = false;
             // Ensure _trigger uses the instance's _handlers
             mockSocketInstance._trigger('disconnect', 'io client disconnect');
+        } else {
+            console.log('MOCK_SOCKET_DISCONNECT: Socket was not connected. No action taken.');
         }
     }),
     removeAllListeners: jest.fn(() => {
@@ -89,8 +92,7 @@ const mockSocketInstance: MockSocket = {
         mockSocketInstance.connected = true;
         // Ensure _trigger uses the instance's _handlers
         mockSocketInstance._trigger('connect');
-    },
-    hola: 'hola'
+    }
 };
 
 export const io = jest.fn(() => mockSocketInstance);

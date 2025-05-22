@@ -70,7 +70,7 @@ export class HyperionStreamClient {
     eventListeners: Map<string, EventListener[]> = new Map();
     tempEventListeners: Map<string, EventListener[]> = new Map();
 
-    private _currentInitialConnectPromise: Promise<void> | null = null;
+    _currentInitialConnectPromise: Promise<void> | null = null;
     private _initialConnectPromiseCallbacks?: { resolve: () => void; reject: (reason?: any) => void; };
     private _initialConnectionSucceededThisAttempt: boolean = false;
 
@@ -137,6 +137,7 @@ export class HyperionStreamClient {
     }
 
     public disconnect(clearSavedRequests = true): void {
+
         this.debugLog('Manual disconnect initiated.');
         this._clearLibActivityTimer();
 
@@ -144,6 +145,7 @@ export class HyperionStreamClient {
         this.connectionInProgress = false;
 
         if (this._initialConnectPromiseCallbacks && !this._initialConnectionSucceededThisAttempt) {
+            console.log('HSC_DISCONNECT: Rejecting initial connect promise because connection attempt was aborted by disconnect.');
             this._initialConnectPromiseCallbacks.reject(new Error('Connection attempt aborted by disconnect.'));
         }
         this._initialConnectPromiseCallbacks = undefined; // Clear them regardless
@@ -152,6 +154,7 @@ export class HyperionStreamClient {
         this._initialConnectionSucceededThisAttempt = false;
 
         if (this.socket) {
+            console.log(`HSC_DISCONNECT: Disconnecting socket...`);
             this.socket.disconnect(); // This will trigger 'disconnect' event on socket
         } else {
             // If socket doesn't exist, ensure online is false.
@@ -363,6 +366,7 @@ export class HyperionStreamClient {
     private _createSocketConnection(endpointUrl: string): Promise<void> { // endpointUrl is available here
         return new Promise((resolve, reject) => {
             if (this.socket) {
+                console.log(`HSC_CSC_DISCONNECTING: Disconnecting existing socket before connecting to ${endpointUrl}.`);
                 this.socket.disconnect();
                 this.socket.removeAllListeners();
                 this.socket = undefined;
@@ -373,6 +377,7 @@ export class HyperionStreamClient {
             // this.activeEndpointURL will reflect the *latest* one being attempted.
             this.activeEndpointURL = endpointUrl; // Set it here for the current attempt
 
+            console.log(`HSC_CSC_CONNECTING: Attempting to connect to ${endpointUrl}...`);
             this.debugLog(`Attempting to connect to ${endpointUrl}...`); // Use endpointUrl for logging
             this.emit(StreamClientEvents.RECONNECT_ATTEMPT, { endpoint: endpointUrl });
 
@@ -555,7 +560,10 @@ export class HyperionStreamClient {
         this.debugLog(`HSC_ACN_ATTEMPTING: Cycle: ${attemptCycleCount}, Attempting endpoint: ${endpointToTry}`); // More specific debug log
     
         try {
+            console.log(`HSC_ACN_ATTEMPTING: Attempting connection to ${endpointToTry}. connectionInProgress: ${this.connectionInProgress}`);
+            
             await this._createSocketConnection(endpointToTry);
+            console.log(`HSC_ACN_ATTEMPTING: Connected to ${endpointToTry}. connectionInProgress: ${this.connectionInProgress}`);
             // If successful, onConnect in _createSocketConnection would have called:
             // - this._initialConnectionSucceededThisAttempt = true;
             // - this._initialConnectPromiseCallbacks.resolve();
@@ -648,7 +656,7 @@ export class HyperionStreamClient {
                     reject(err);
                 }
             };
-
+            console.log(`Initiating connection sequence with ${this.internalEndpoints.length} endpoint(s). tryForever: ${this.options.tryForever}`);
             this.debugLog(`Initiating connection sequence with ${this.internalEndpoints.length} endpoint(s). tryForever: ${this.options.tryForever}`);
             // Start the connection attempt cycle
             this._attemptNextConnection(0).catch(errorFromOuterAttempt => {
